@@ -5456,6 +5456,21 @@ function formatCount(value: number | null | undefined) {
   return value.toLocaleString("en-US");
 }
 
+/**
+ * Operator override for the continuation prompt budget:
+ * `runtimeConfig.heartbeat.continuationMessageBudgetChars` (0 disables it).
+ * Unset keeps the adapter-utils default.
+ */
+export function readContinuationMessageBudgetChars(
+  runtimeConfig: unknown,
+): number | undefined {
+  const heartbeat = parseObject(parseObject(runtimeConfig).heartbeat);
+  const value = heartbeat.continuationMessageBudgetChars;
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.floor(value)
+    : undefined;
+}
+
 export function parseSessionCompactionPolicy(
   agent: typeof agents.$inferSelect,
 ): SessionCompactionPolicy {
@@ -20742,6 +20757,7 @@ export function heartbeatService(
               previousContextRunId: taskSession?.lastRunId,
               summary: safeContinuationSummary?.body ?? null,
               exposeLowTrustRaw,
+              messageBudgetChars: readContinuationMessageBudgetChars(agent.runtimeConfig),
             })
           : null;
       context.executionContinuation = executionContinuation;
