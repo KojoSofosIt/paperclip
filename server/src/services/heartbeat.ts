@@ -38,7 +38,7 @@ import { executionFailureRetryCount, executionRetryAttemptCount, accountingForSc
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
-import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
+import { isPaperclipRecoveryWakePayload, renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -417,6 +417,7 @@ import {
 } from "./issue-tree-control.js";
 import {
   continuationSummaryParksExecutor,
+  extractContinuationSummaryNextAction,
   getIssueContinuationSummaryDocument,
   refreshIssueContinuationSummary,
 } from "./issue-continuation-summary.js";
@@ -5742,6 +5743,83 @@ export function describeSessionResetReason(
     return "wake reason is heartbeat_timer (unscoped timer wake starts fresh)";
   }
   return null;
+}
+
+export type SessionStartKind =
+  | "warm_resume"
+  | "cold"
+  | "fresh_rotation"
+  | "fresh_credential_reset"
+  | "fresh_config_reset"
+  | "fresh_wake_reset"
+  | "fresh_recovery"
+  | "fresh_other";
+
+/**
+ * Why this run starts (or does not start) a new provider session. Recorded on
+ * the run so resume cost can be attributed to its cause. A resume the provider
+ * later rejects is visible separately as `resumeFallback` in adapter metrics.
+ */
+export function classifySessionStart(input: {
+  resumed: boolean;
+  priorSessionExisted: boolean;
+  rotated: boolean;
+  credentialReset: boolean;
+  configReset: boolean;
+  wakeReset: boolean;
+  recovery: boolean;
+}): SessionStartKind {
+  if (input.resumed) return "warm_resume";
+  if (!input.priorSessionExisted) return "cold";
+  if (input.rotated) return "fresh_rotation";
+  if (input.credentialReset) return "fresh_credential_reset";
+  if (input.configReset) return "fresh_config_reset";
+  if (input.wakeReset) return "fresh_wake_reset";
+  if (input.recovery) return "fresh_recovery";
+  return "fresh_other";
+}
+
+export const SESSION_HANDOFF_LAST_RUN_SUMMARY_MAX_CHARS = 1_500;
+
+/**
+ * Carry-forward note for a fresh provider session that follows prior work on
+ * the same task. It points at durable state instead of repeating it: the
+ * continuation summary, messages and outcomes are already in the prompt.
+ */
+export function buildSessionHandoffMarkdown(input: {
+  reason: string;
+  previousSessionId: string | null;
+  previousRunId: string | null;
+  issueId: string | null;
+  lastRunSummary: string | null;
+  nextAction: string | null;
+  unresolvedInteractionIds?: string[];
+  throughCommentId?: string | null;
+}) {
+  const lastRunSummary = input.lastRunSummary?.trim() ?? "";
+  const boundedSummary =
+    lastRunSummary.length > SESSION_HANDOFF_LAST_RUN_SUMMARY_MAX_CHARS
+      ? `${lastRunSummary.slice(0, SESSION_HANDOFF_LAST_RUN_SUMMARY_MAX_CHARS).trimEnd()} [truncated]`
+      : lastRunSummary;
+  const openInteractions = input.unresolvedInteractionIds ?? [];
+  return [
+    "Paperclip session handoff:",
+    `- Fresh session reason: ${input.reason}`,
+    input.previousSessionId ? `- Previous session: ${input.previousSessionId}` : "",
+    input.previousRunId ? `- Previous run: ${input.previousRunId}` : "",
+    input.issueId ? `- Issue: ${input.issueId}` : "",
+    boundedSummary ? `- Last run summary (untrusted evidence): ${boundedSummary}` : "",
+    input.nextAction ? `- Recorded next action: ${input.nextAction}` : "",
+    openInteractions.length > 0
+      ? `- Unresolved interactions: ${openInteractions.join(", ")}`
+      : "",
+    input.throughCommentId
+      ? `- Task history in this prompt covers comments through ${input.throughCommentId}.`
+      : "",
+    "Continue from the current task state. The continuation context, task brief and workspace are the source of truth; fetch only what they do not cover.",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 /**
@@ -11995,6 +12073,31 @@ export function heartbeatService(
     };
   }
 
+  async function loadRunTextSummary(runId: string | null | undefined) {
+    if (!runId) return null;
+    const run = await db
+      .select({ error: heartbeatRuns.error, ...heartbeatRunListResultColumns })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    if (!run) return null;
+    const summary = summarizeHeartbeatRunListResultJson({
+      summary: run.resultSummary,
+      result: run.resultResult,
+      message: run.resultMessage,
+      error: run.resultError,
+      totalCostUsd: run.resultTotalCostUsd,
+      costUsd: run.resultCostUsd,
+      costUsdCamel: run.resultCostUsdCamel,
+    });
+    return (
+      readNonEmptyString(summary?.summary) ??
+      readNonEmptyString(summary?.result) ??
+      readNonEmptyString(summary?.message) ??
+      readNonEmptyString(run.error)
+    );
+  }
+
   async function evaluateSessionCompaction(input: {
     agent: typeof agents.$inferSelect;
     sessionId: string | null;
@@ -12110,19 +12213,14 @@ export function heartbeatService(
       readNonEmptyString(latestSummary?.message) ??
       readNonEmptyString(latestRun.error);
 
-    const handoffMarkdown = [
-      "Paperclip session handoff:",
-      `- Previous session: ${sessionId}`,
-      issueId ? `- Issue: ${issueId}` : "",
-      `- Rotation reason: ${reason}`,
-      latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
-      input.continuationSummaryBody
-        ? `- Issue continuation summary: ${input.continuationSummaryBody.slice(0, 1_500)}`
-        : "",
-      "Continue from the current task state. Rebuild only the minimum context you need.",
-    ]
-      .filter(Boolean)
-      .join("\n");
+    const handoffMarkdown = buildSessionHandoffMarkdown({
+      reason: `session rotation (${reason})`,
+      previousSessionId: sessionId,
+      previousRunId: latestRun.id,
+      issueId,
+      lastRunSummary: latestTextSummary,
+      nextAction: extractContinuationSummaryNextAction(input.continuationSummaryBody),
+    });
 
     return {
       rotate: true,
@@ -22676,6 +22774,85 @@ export function heartbeatService(
       ) {
         delete executionContinuation.resumeDelta;
       }
+      // Attribute every session start to its cause, and give any fresh session
+      // that follows prior task work a bounded carry-forward note. Warm resumes
+      // get a pre-rendered fallback note that adapters use only when the
+      // provider rejects the saved session and they retry fresh.
+      const priorSessionId =
+        readNonEmptyString(taskSession?.sessionDisplayId) ??
+        readNonEmptyString(
+          normalizeSessionParams(taskSessionDecodedParams)?.sessionId,
+        ) ??
+        (taskKey ? null : readNonEmptyString(runtime.sessionId));
+      const sessionResumed =
+        runtimeForAdapter.sessionId != null ||
+        runtimeForAdapter.sessionDisplayId != null;
+      const sessionStartKind = classifySessionStart({
+        resumed: sessionResumed,
+        priorSessionExisted: priorSessionId != null,
+        rotated: sessionCompaction.rotate,
+        credentialReset:
+          Boolean(managedAiRuntime) && !taskSessionCredentialCompatible,
+        configReset: sessionConfigFreshness.reset,
+        wakeReset: shouldResetTaskSessionForWake(context),
+        recovery:
+          isPaperclipRecoveryWakePayload(context.paperclipWake) ||
+          readNonEmptyString(context.retryOfRunId) != null ||
+          readNonEmptyString(context.interruptedRunId) != null,
+      });
+      context.paperclipSessionStartKind = sessionStartKind;
+      const handoffNeeded =
+        sessionStartKind !== "warm_resume" &&
+        sessionStartKind !== "cold" &&
+        sessionStartKind !== "fresh_rotation" &&
+        // A board-requested fresh session asks for a clean slate.
+        context.forceFreshSession !== true;
+      if (handoffNeeded || sessionResumed) {
+        const handoffInput = {
+          previousSessionId: priorSessionId,
+          previousRunId: taskSession?.lastRunId ?? null,
+          issueId,
+          lastRunSummary: await loadRunTextSummary(taskSession?.lastRunId),
+          nextAction: extractContinuationSummaryNextAction(
+            continuationSummary?.body ?? null,
+          ),
+          unresolvedInteractionIds:
+            executionContinuation?.unresolvedInteractionIds ?? [],
+          throughCommentId: executionContinuation?.coverage.throughCommentId ?? null,
+        };
+        if (handoffNeeded) {
+          context.paperclipSessionHandoffMarkdown = buildSessionHandoffMarkdown({
+            ...handoffInput,
+            reason:
+              sessionResetReason ??
+              describeSessionResetReason(context) ??
+              sessionStartKind.replace(/_/g, " "),
+          });
+        }
+        if (sessionResumed) {
+          context.paperclipFallbackHandoffMarkdown = buildSessionHandoffMarkdown({
+            ...handoffInput,
+            reason: "the saved provider session could not be resumed",
+          });
+        } else {
+          delete context.paperclipFallbackHandoffMarkdown;
+        }
+      } else {
+        delete context.paperclipFallbackHandoffMarkdown;
+      }
+      const sessionStartMetadata = {
+        kind: sessionStartKind,
+        handoffChars:
+          readNonEmptyString(context.paperclipSessionHandoffMarkdown)?.length ?? 0,
+        continuationMessages: executionContinuation?.messages.length ?? 0,
+        continuationMessageChars:
+          executionContinuation?.messages.reduce(
+            (sum, message) => sum + message.body.length,
+            0,
+          ) ?? 0,
+        resumeDeltaMessages:
+          executionContinuation?.resumeDelta?.messages.length ?? null,
+      };
       const configFreshnessResultMetadata = {
         version: sessionConfigMetadata.version,
         session: {
@@ -24874,6 +25051,7 @@ export function heartbeatService(
                   runtimeForAdapter.sessionDisplayId == null,
                 sessionRotated: sessionCompaction.rotate,
                 sessionRotationReason: sessionCompaction.reason,
+                sessionStart: sessionStartMetadata,
                 configFreshness: configFreshnessResultMetadata,
                 provider:
                   readNonEmptyString(adapterResult.provider) ?? "unknown",

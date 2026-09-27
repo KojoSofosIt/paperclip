@@ -1,6 +1,7 @@
 import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractionResponse } from "../services/queued-interaction-response.js";
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
+import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { extractIssueReferenceIdentifiers, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
@@ -15348,6 +15349,33 @@ export function issueRoutes(
       order,
       limit,
     });
+    const actor = getActorInfo(req);
+    if (
+      !afterCommentId &&
+      actor.actorType === "agent" &&
+      actor.agentId &&
+      actor.runId
+    ) {
+      // Run log only (stays in the instance database): measures how often an
+      // agent run reloads a whole thread instead of reading a delta. Recorded
+      // as a lifecycle event so it never counts as run-liveness evidence.
+      await appendHeartbeatRunEvent(db, {
+        companyId: issue.companyId,
+        runId: actor.runId,
+        agentId: actor.agentId,
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Agent read the full comment thread",
+        payload: {
+          kind: "context_fetch",
+          mode: "full_comment_thread",
+          issueId: issue.id,
+          commentCount: comments.length,
+          limit,
+        },
+      }).catch(() => undefined);
+    }
     res.json(
       await runRedactions.redactForIssue(issue.companyId, issue.id, comments),
     );

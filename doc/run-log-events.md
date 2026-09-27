@@ -234,3 +234,25 @@ The message distinguishes an automatic retry from work that is no longer eligibl
 This pre-provider wait records `ai_connection_busy` on the cancelled run and does
 not consume the provider-failure retry allowance. The event contains no credentials
 and creates no Telemetry or OpenTelemetry export.
+
+## Resume cost attribution
+
+Each legacy adapter run records `usageJson.sessionStart` on the run row. It
+stays in the instance database and is not a Telemetry or OpenTelemetry export.
+
+| Field | Meaning |
+| --- | --- |
+| `kind` | Why the provider session was reused or started fresh: `warm_resume`, `cold`, `fresh_rotation`, `fresh_credential_reset`, `fresh_config_reset`, `fresh_wake_reset`, `fresh_recovery`, or `fresh_other`. |
+| `handoffChars` | Size of the carry-forward note given to a fresh session that follows prior task work. |
+| `continuationMessages` / `continuationMessageChars` | Size of the task history in the continuation envelope before the prompt budget is applied. |
+| `resumeDeltaMessages` | Messages sent as a resume delta, or `null` when the full history was used. |
+
+Each `adapter.invoke` event's `promptMetrics` also carries `resumedSession`
+and `resumeFallback` (0 or 1). `resumeFallback: 1` marks the second attempt
+after the provider rejected a saved session.
+
+When an agent run reads `GET /api/issues/:id/comments` without an
+`after`/`afterCommentId` cursor, the run log gets a `lifecycle` event with
+payload `{ kind: "context_fetch", mode: "full_comment_thread", issueId,
+commentCount, limit }`. It contains no comment content. It is a lifecycle
+event, so it never counts as run-liveness evidence.
