@@ -47,6 +47,8 @@ export interface ExecutionContinuationEnvelope {
      * which case renderers fall back to the full evidence.
      */
     evidence?: {
+      /** False when the objective equals the one the base run delivered. */
+      objectiveChanged?: boolean;
       completedWorkChanged: boolean;
       interactionOutcomes: ExecutionContinuationEnvelope["interactionOutcomes"];
       completedActions: NonNullable<ExecutionContinuationEnvelope["completedActions"]>;

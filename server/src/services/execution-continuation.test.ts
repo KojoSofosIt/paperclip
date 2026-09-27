@@ -528,6 +528,13 @@ it("sends only new evidence to a resumed session and compares jsonb-reordered ke
   expect(resumed).not.toContain("OLD ACTION");
   expect(resumed).not.toContain("SUMMARY BODY");
   expect(resumed).toContain("completedWorkUnchanged");
+  expect(evidence?.objectiveChanged).toBe(true);
+  const unchangedObjective = renderPaperclipWakePrompt(
+    { executionContinuation: { ...envelope, resumeDelta: { ...envelope.resumeDelta, evidence: { ...evidence!, objectiveChanged: false } } } },
+    { resumedSession: true },
+  );
+  expect(unchangedObjective).toContain("objectiveUnchanged");
+  expect(unchangedObjective).not.toContain("Ship the fix.");
   expect(resumed).not.toContain("Issue continuation summary:");
 
   const fresh = renderPaperclipWakePrompt(

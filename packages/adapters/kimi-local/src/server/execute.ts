@@ -24,6 +24,7 @@ import {
 import {
   asNumber,
   asString,
+  asBoolean,
   asStringArray,
   buildPaperclipEnv,
   buildRuntimeToolsEnv,
@@ -502,6 +503,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   })();
 
   const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
+  // Opt-in for operators who verified that this CLI's resume keeps the first
+  // turn: resume deltas then skip the startup instructions and runtime notes.
+  const omitStartupContextOnResume = asBoolean(config.omitStartupContextOnResume, false);
   const templateData = {
     agentId: agent.id,
     companyId: agent.companyId,
@@ -527,6 +531,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       suppressIssueDescription: taskContextNote.length > 0,
     });
     const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
+    const omitStartupContext = shouldUseResumeDeltaPrompt && omitStartupContextOnResume;
     const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
       ? ""
       : renderTemplate(promptTemplate, templateData);
@@ -534,23 +539,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const paperclipEnvNote = renderPaperclipEnvNote(env);
     const apiAccessNote = renderApiAccessNote(env);
     const basePrompt = joinPromptSections([
-      instructionsPrefix,
+      omitStartupContext ? "" : instructionsPrefix,
       renderedBootstrapPrompt,
       wakePrompt,
       taskContextNote,
       sessionHandoffNote,
-      paperclipEnvNote,
-      apiAccessNote,
+      omitStartupContext ? "" : paperclipEnvNote,
+      omitStartupContext ? "" : apiAccessNote,
       renderedPrompt,
     ]);
     const promptMetrics = {
       promptChars: basePrompt.length,
-      instructionsChars: instructionsPrefix.length,
+      instructionsChars: omitStartupContext ? 0 : instructionsPrefix.length,
       bootstrapPromptChars: renderedBootstrapPrompt.length,
       wakePromptChars: wakePrompt.length,
       taskContextChars: taskContextNote.length,
       sessionHandoffChars: sessionHandoffNote.length,
-      runtimeNoteChars: paperclipEnvNote.length + apiAccessNote.length,
+      runtimeNoteChars: omitStartupContext ? 0 : paperclipEnvNote.length + apiAccessNote.length,
       heartbeatPromptChars: renderedPrompt.length,
       resumedSession: resumedSession ? 1 : 0,
       resumeFallback: resumeFailed ? 1 : 0,

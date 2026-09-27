@@ -459,6 +459,7 @@ export function continuationEvidenceDelta(
   const priorActions = priorSet(priorEnvelope.completedActions);
   const priorRecovery = priorSet(priorEnvelope.recoveryOutcomes);
   return {
+    objectiveChanged: (string(priorEnvelope.objective) ?? null) !== current.objective,
     completedWorkChanged:
       (string(priorEnvelope.completedWork) ?? null) !== (current.completedWork ?? null),
     interactionOutcomes: current.interactionOutcomes.filter(

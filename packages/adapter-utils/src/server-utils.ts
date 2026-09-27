@@ -2266,6 +2266,17 @@ function renderPaperclipWakePromptBody(
   // template-less adapters need the wake-payload copy.
   const includeExecutionContract = options.conversationMode !== true &&
     (resumedSession || options.includeExecutionContract === true);
+  // A resumed session already received the full contract when it picked up
+  // the task. Ordinary resume deltas (comments, timers) repeat only the
+  // disposition check; assignment, recovery, disposition-repair and liveness
+  // wakes, and template-less fresh prompts, keep the full contract.
+  const compactExecutionContract =
+    resumedSession &&
+    options.includeExecutionContract !== true &&
+    !isAssignmentShapedPaperclipWakeReason(normalized.reason) &&
+    !isPaperclipRecoveryWakePayload(value) &&
+    !normalized.dispositionRepair &&
+    !normalized.livenessContinuation;
   const hasWakeCommentBatch =
     normalized.comments.length > 0 ||
     normalized.includedCount > 0 ||
@@ -2381,6 +2392,11 @@ function renderPaperclipWakePromptBody(
           `Fallback preference order: (1) send back to ${originalAssigneeLabel} with a retry instruction; (2) fix the runtime/adapter/workspace problem, then send it back; (3) reassign to another agent with the right specialty; (4) convert to an explicit manual-review state for the board.`,
           "",
         ]
+      : includeExecutionContract && compactExecutionContract
+        ? [
+            "Execution contract: unchanged since this session started. Immediately before returning, verify that Paperclip records a valid final disposition: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists; a successful process exit or final response is not sufficient.",
+            "",
+          ]
       : includeExecutionContract
         ? [
             "Execution contract: take concrete action in this heartbeat when the issue is actionable; do not stop at a plan unless planning was requested. Leave durable progress and then give the issue a clear final disposition before ending the heartbeat: `done`, `in_review` with a real reviewer/approval/interaction path, `blocked` with first-class blockers or a named unblock owner/action, delegated follow-up issues with blockers, or `in_progress` only when a live continuation path exists. Immediately before returning, verify that Paperclip records one of those dispositions; a successful process exit or final response is not sufficient. If no valid disposition is recorded, record it now and do not end the run. After 2 consecutive failures of the same control-plane write, stop retrying it for the rest of the heartbeat, continue useful work, report the failure in the final response, and rely on the adapter/runtime status channel as the sanctioned fallback. Use child issues for long or parallel delegated work instead of polling. Comments, documents, screenshots, work products, and `Remaining` bullets are evidence, not valid liveness paths by themselves.",
@@ -2508,7 +2524,12 @@ function renderPaperclipWakePromptBody(
         ? [`${budgeted.omittedCount} older agent or system message(s) are id-only stubs (\`omitted: true\`) to bound this prompt. Every human message is complete. Fetch \`GET /api/issues/${snapshot.issueId}/comments/{commentId}\` only if you need one of the omitted bodies.`]
         : []),
       "humanResponses contains server-verified user answers and decisions; apply each only to its question or approval scope.");
-    const { interactionOutcomes, completedActions, completedWork, recoveryOutcomes, ...requestContext } = continuation;
+    const { interactionOutcomes, completedActions, completedWork, recoveryOutcomes, ...fullRequestContext } = continuation;
+    // The resumed session already holds an unchanged objective (often the full
+    // task description); say so instead of repeating it.
+    const requestContext = deltaEvidence?.objectiveChanged === false
+      ? { ...fullRequestContext, objective: undefined, objectiveUnchanged: true }
+      : fullRequestContext;
     const encodeData = (data: unknown) => markdownFencedText(JSON.stringify(data, (_key, value) =>
       typeof value === "string" ? value.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "") : value,
     ).replace(/</g, "\\u003c").replace(/>/g, "\\u003e"));

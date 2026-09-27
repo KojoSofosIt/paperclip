@@ -43,6 +43,7 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to the run prompt
 - promptTemplate (string, optional): run prompt template
+- omitStartupContextOnResume (boolean, optional, default false): on resumed sessions, skip resending the instructions file and runtime notes; enable only after verifying the CLI resume keeps the first turn
 - model (string, optional): Gemini model id. Defaults to auto.
 - engine (string, optional): defaults to ACP, including legacy unset/"auto" values. Missing prerequisites and execution failures fail the run without changing engines. Set "cli" to explicitly select the CLI engine.
 - sandbox (boolean, optional): run in sandbox mode (default: false, passes --sandbox=none)
