@@ -1,7 +1,7 @@
 # Resume token optimization plan
 
 Date: 2026-09-27
-Status: proposal
+Status: implemented (Phases 0–6; Phase 5 and 6 narrowed, Phase 7 pending data)
 Builds on: [2026-03-13 Token Optimization Plan](2026-03-13-TOKEN-OPTIMIZATION-PLAN.md)
 Related: [Reliable execution recovery](2026-09-08-reliable-execution-recovery.md),
 [Continuation accounting baseline](2026-09-22-continuation-accounting-baseline.md),
@@ -420,3 +420,25 @@ Guardrails, which must not get worse:
   (`doc/execution-semantics.md`, "native runner session").
 - Changes to telemetry (`packages/shared/src/telemetry/`). Every metric in this
   plan uses the run log or the run metadata.
+
+## Implementation status (2026-09-27)
+
+| Phase | Result | Where |
+|---|---|---|
+| 0. Measurement | Done. `usageJson.sessionStart` records the start kind, handoff size, and continuation sizes. `promptMetrics` records `resumedSession` and `resumeFallback` for each attempt. A full comment-thread read by an agent run writes a `lifecycle` run-log event. | `server/src/services/heartbeat.ts` (`classifySessionStart`), `server/src/routes/issues.ts`, `doc/run-log-events.md` |
+| 1. Fallback prompt | Done for claude, codex, gemini, cursor, kimi, opencode, grok, and pi. Each provider attempt builds its own prompt. | adapter `execute.ts` files, `selectPaperclipSessionHandoffNote` |
+| 2. Bounded envelope | Done, with changes. See the deviations below. | `packages/adapter-utils/src/continuation-budget.ts`, `execution-continuation.ts`, `renderPaperclipWakePrompt` |
+| 3. Structured handoff | Done. `buildSessionHandoffMarkdown` covers rotation and every fresh start that follows prior work. A board `forceFreshSession` gets no handoff. Warm resumes carry `paperclipFallbackHandoffMarkdown`. | `heartbeat.ts` |
+| 4. Lean warm resume | Done. Ordinary resume deltas get a compact execution contract. An unchanged objective is replaced by a marker. `omitStartupContextOnResume` is an opt-in and defaults to off. | `server-utils.ts`, gemini/cursor/kimi/opencode adapters |
+| 5. Fewer config resets | Narrowed. Only a change to plain env binding values keeps the session. | `resolveTaskSessionConfigFreshness` |
+| 6. Skill split | Partial. `SKILL.md` went from 60.3 KB to 54.0 KB. | `skills/paperclip/` |
+| 7. Claude/Codex rotation | Not started. This phase waits for the Phase 0 data, as planned. | — |
+
+### Deviations from the plan, with reasons
+
+- **Phase 2: no summary checkpoint.** The issue continuation summary is created automatically from the last run's result. It does not summarize the comment thread, so it cannot "cover" earlier comments. `summaryThroughCommentId` therefore stays `null`. The budget keeps every human-authored message, every origin comment, and the most recent 8 messages. It trims older agent and system bodies to id-only stubs.
+- **Phase 2: the budget applies at render time.** The stored envelope in `context_snapshot` keeps the full message bodies. The resume-delta comparison and native continuation need those bodies. A smaller stored copy is a possible follow-up.
+- **Phase 4: compact contract, not hash tracking.** Ordinary resume deltas still repeat the disposition check, because missing dispositions are a known failure mode. Assignment, recovery, disposition-repair, and liveness wakes keep the full contract.
+- **Phase 4: startup-context skip is opt-in.** The resume behavior of the Gemini, Cursor, Kimi, and OpenCode CLIs was not verified live. An operator enables `omitStartupContextOnResume` for an adapter after verifying it.
+- **Phase 5: secrets still reset.** A secret rotation also changes the `adapterConfig` fingerprint. It is a deliberate boundary: a rotated key can belong to a different provider account, and resuming would send the old transcript to that account. There is also no delayed reset for instruction changes. Claude and Codex inject instructions only at session start and do not rotate, so a delayed reset could leave agents on stale instructions indefinitely.
+- **Phase 6: headings kept.** The runner capability inventory treats every skill heading as a normative row, and it pins the row count. Each moved section therefore keeps its heading and a pointer. The agent evals were not run, because the eval corpus is in the private `paperclip-evals` repository.
