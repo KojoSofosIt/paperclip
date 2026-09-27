@@ -5868,7 +5868,10 @@ const SESSION_CONFIG_FINGERPRINT_VERSION_KEY =
 const SESSION_CONFIG_CATEGORIES_KEY = "__paperclipConfigCategories";
 const SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY =
   "__paperclipConfigCategoryFingerprints";
+const SESSION_CONFIG_BINDING_NAMES_FINGERPRINT_KEY =
+  "__paperclipConfigBindingNamesFingerprint";
 const PAPERCLIP_SESSION_METADATA_KEYS = new Set([
+  SESSION_CONFIG_BINDING_NAMES_FINGERPRINT_KEY,
   SESSION_AI_CREDENTIAL_IDENTITY_KEY,
   SESSION_CONFIGURED_MODEL_KEY,
   SESSION_CONFIG_FINGERPRINT_KEY,
@@ -5912,12 +5915,20 @@ type EffectiveRunSessionConfigMetadata = {
   categories: EffectiveRunSessionConfigCategory[];
   categoryFingerprints: Record<EffectiveRunSessionConfigCategory, string>;
   fingerprints: EffectiveRunConfigFingerprints;
+  /**
+   * Hash of secret and env binding names only (no values or versions). When
+   * only plain env binding values change and this hash matches, the session
+   * stays.
+   */
+  bindingNamesFingerprint?: string;
 };
 
 type TaskSessionConfigFreshnessDecision = {
   reset: boolean;
   reasons: string[];
   changedCategories: EffectiveRunSessionConfigCategory[];
+  /** Categories whose values changed without requiring a new session. */
+  refreshedCategories?: EffectiveRunSessionConfigCategory[];
   storedFingerprint: string | null;
   nextFingerprint: string | null;
 };
@@ -6231,6 +6242,9 @@ function readConfigFingerprintFromSessionParams(
     categoryFingerprints: parseStoredConfigCategoryFingerprints(
       sessionParams[SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY],
     ),
+    bindingNamesFingerprint: readNonEmptyString(
+      sessionParams[SESSION_CONFIG_BINDING_NAMES_FINGERPRINT_KEY],
+    ),
   };
 }
 
@@ -6524,6 +6538,46 @@ async function resolveInstructionsConfigFingerprintMetadata(
   return metadata;
 }
 
+/**
+ * Names-only view of secret and env bindings: which keys and secrets are bound,
+ * not their values, versions or provider revisions. A value rotation keeps the
+ * same names; adding, removing or re-pointing a binding changes this hash.
+ */
+export function buildConfigBindingNamesFingerprint(input: {
+  secretManifest: readonly EffectiveRunConfigSecretManifestEntry[];
+  environmentEnv: unknown;
+  projectEnv: unknown;
+  routineEnv: unknown;
+}) {
+  const secrets = input.secretManifest
+    .map((entry) => {
+      const record = entry as Record<string, unknown>;
+      return [
+        readNonEmptyString(record.configPath) ?? "",
+        readNonEmptyString(record.envKey) ?? "",
+        readNonEmptyString(record.secretId) ?? "",
+        readNonEmptyString(record.bindingId) ?? "",
+        readNonEmptyString(record.provider) ?? "",
+      ].join("\u0000");
+    })
+    .sort();
+  const envKeys = (value: unknown) => Object.keys(parseObject(value)).sort();
+  const names = {
+    secrets,
+    environment: envKeys(input.environmentEnv),
+    project: envKeys(input.projectEnv),
+    routine: envKeys(input.routineEnv),
+  };
+  return `sha256:${createHash("sha256").update(JSON.stringify(names)).digest("hex")}`;
+}
+
+// Plain env binding values reach the process on every run and are not part
+// of the conversation. Secret changes stay a reset boundary: a rotated key can
+// belong to a different provider account, and a resumed transcript would be
+// sent to it. (Secret refs also change the adapterConfig/secrets categories.)
+const REFRESH_ONLY_SESSION_CONFIG_CATEGORIES: ReadonlySet<EffectiveRunSessionConfigCategory> =
+  new Set(["envBindings"]);
+
 function buildSessionConfigCategoryValues(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
@@ -6627,6 +6681,12 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
     categories: [...EFFECTIVE_RUN_SESSION_CONFIG_CATEGORIES],
     categoryFingerprints,
     fingerprints,
+    bindingNamesFingerprint: buildConfigBindingNamesFingerprint({
+      secretManifest,
+      environmentEnv: input.environmentEnv,
+      projectEnv: input.projectEnv,
+      routineEnv: input.routineEnv,
+    }),
   };
 }
 
@@ -6892,6 +6952,10 @@ function attachPaperclipSessionMetadataToSessionParams(
     next[SESSION_CONFIG_CATEGORIES_KEY] = configMetadata.categories;
     next[SESSION_CONFIG_CATEGORY_FINGERPRINTS_KEY] =
       configMetadata.categoryFingerprints;
+    if (configMetadata.bindingNamesFingerprint) {
+      next[SESSION_CONFIG_BINDING_NAMES_FINGERPRINT_KEY] =
+        configMetadata.bindingNamesFingerprint;
+    }
   }
   return next;
 }
@@ -6968,6 +7032,7 @@ export function resolveTaskSessionConfigFreshness(input: {
   }
 
   let changedCategories: EffectiveRunSessionConfigCategory[] = [];
+  let refreshedCategories: EffectiveRunSessionConfigCategory[] = [];
   if (input.configMetadata) {
     if (!storedConfig && !input.preserveLegacySessionWithoutConfigMetadata) {
       changedCategories = [...input.configMetadata.categories];
@@ -6990,9 +7055,25 @@ export function resolveTaskSessionConfigFreshness(input: {
         previous: storedConfig.categoryFingerprints,
         next: input.configMetadata.categoryFingerprints,
       });
-      reasons.push(
-        `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
-      );
+      // A value-only change to plain env bindings keeps the session. A changed
+      // set of bound names, any other category, or a session without the
+      // names hash still resets.
+      const valueOnlyRefresh =
+        changedCategories.length > 0 &&
+        changedCategories.every((category) =>
+          REFRESH_ONLY_SESSION_CONFIG_CATEGORIES.has(category),
+        ) &&
+        Boolean(storedConfig.bindingNamesFingerprint) &&
+        storedConfig.bindingNamesFingerprint ===
+          input.configMetadata.bindingNamesFingerprint;
+      if (valueOnlyRefresh) {
+        refreshedCategories = changedCategories;
+        changedCategories = [];
+      } else {
+        reasons.push(
+          `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
+        );
+      }
     }
   }
 
@@ -7002,6 +7083,7 @@ export function resolveTaskSessionConfigFreshness(input: {
     reset: reasons.length > 0,
     reasons,
     changedCategories,
+    ...(refreshedCategories.length > 0 ? { refreshedCategories } : {}),
     storedFingerprint: storedConfig?.fingerprint ?? null,
     nextFingerprint: input.configMetadata?.fingerprint ?? null,
   };
@@ -22861,6 +22943,7 @@ export function heartbeatService(
           reset: resetTaskSession,
           resetReasons: sessionConfigFreshness.reasons,
           changedCategories: sessionConfigFreshness.changedCategories,
+          refreshedCategories: sessionConfigFreshness.refreshedCategories ?? [],
           taskSessionAvailable: taskSession != null,
           taskSessionReused: taskSessionForRun != null,
           storedFingerprintPresent: Boolean(

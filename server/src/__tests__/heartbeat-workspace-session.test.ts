@@ -2511,6 +2511,64 @@ describe("effective run session config freshness", () => {
     }
   });
 
+  it("keeps the session when only plain env binding values change under unchanged names", async () => {
+    const base = await buildSessionConfigMetadata();
+    const storedParams = {
+      ...sessionParamsWithConfigMetadata(base),
+      __paperclipConfigBindingNamesFingerprint: base.bindingNamesFingerprint,
+    };
+    const secret = (overrides: Record<string, unknown>) => [{
+      configPath: "env.OPENAI_API_KEY",
+      envKey: "OPENAI_API_KEY",
+      secretId: "secret-1",
+      bindingId: "binding-1",
+      secretKey: "openai-api-key",
+      version: 7,
+      provider: "local_encrypted",
+      outcome: "success" as const,
+      ...overrides,
+    }];
+    const decide = (configMetadata: SessionConfigMetadata) => resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: storedParams,
+      configMetadata,
+    });
+
+    const envValueChanged = await buildSessionConfigMetadata({
+      projectEnv: { PROJECT_FLAG: "rotated-value" },
+      environmentEnv: { ENVIRONMENT_FLAG: "disabled" },
+    });
+    expect(envValueChanged.fingerprint).not.toBe(base.fingerprint);
+    expect(decide(envValueChanged)).toMatchObject({
+      reset: false,
+      reasons: [],
+      changedCategories: [],
+      refreshedCategories: ["envBindings"],
+    });
+
+    for (const [name, metadata] of [
+      ["added env key", await buildSessionConfigMetadata({ projectEnv: { PROJECT_FLAG: "enabled", NEW_FLAG: "x" } })],
+      // A rotated key can belong to another provider account.
+      ["secret version rotation", await buildSessionConfigMetadata({ secretManifest: secret({ version: 8 }) })],
+      ["re-pointed secret", await buildSessionConfigMetadata({ secretManifest: secret({ secretId: "secret-2" }) })],
+      ["env value plus runtime skill change", await buildSessionConfigMetadata({
+        projectEnv: { PROJECT_FLAG: "rotated-value" },
+        runtimeSkills: [],
+      })],
+    ] as const) {
+      expect(decide(metadata).reset, name).toBe(true);
+    }
+
+    // Sessions stored before the names hash existed keep resetting.
+    expect(resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(base),
+      configMetadata: envValueChanged,
+    }).reset).toBe(true);
+  });
+
   it("detects instructions content drift without storing the contents", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-session-fingerprint-"));
     const instructionsPath = path.join(root, "AGENTS.md");
