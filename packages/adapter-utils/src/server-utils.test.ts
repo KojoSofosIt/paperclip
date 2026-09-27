@@ -1503,6 +1503,29 @@ describe("renderPaperclipWakePrompt", () => {
     );
   });
 
+  it("repeats only the disposition check on ordinary resume deltas", () => {
+    const payload = {
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1580", title: "Update prompts", status: "in_progress" },
+      commentWindow: { requestedCount: 0, includedCount: 0, missingCount: 0 },
+      comments: [],
+      fallbackFetchNeeded: false,
+    };
+    const resumed = renderPaperclipWakePrompt(payload, { resumedSession: true });
+    expect(resumed).toContain("Execution contract: unchanged since this session started");
+    expect(resumed).toContain("verify that Paperclip records a valid final disposition");
+    expect(resumed).toContain("a successful process exit or final response is not sufficient");
+    expect(resumed).not.toContain("Execution contract: take concrete action in this heartbeat");
+
+    const recovery = renderPaperclipWakePrompt(
+      { ...payload, reason: "issue_recovery_action_restored" },
+      { resumedSession: true },
+    );
+    expect(recovery).toContain("Execution contract: take concrete action in this heartbeat");
+    const optedIn = renderPaperclipWakePrompt(payload, { resumedSession: true, includeExecutionContract: true });
+    expect(optedIn).toContain("Execution contract: take concrete action in this heartbeat");
+  });
+
   it("adds the execution contract to resume delta prompts and opted-in fresh prompts", () => {
     const payload = {
       reason: "issue_assigned",

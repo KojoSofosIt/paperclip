@@ -240,11 +240,7 @@ Run-scoped writes are subtree-scoped: the delegate's run can write to its own is
 
 ## Managing A User's Inbox
 
-Agents may archive an issue from a user's Mine inbox with `POST /api/issues/{issueId}/inbox-archive` and reverse it with `DELETE /api/issues/{issueId}/inbox-archive`. Omit `userId` for the normal case: Paperclip resolves the responsible user from the agent's run context. An explicit `userId` targets another user and requires either that user's saved opt-in policy (`open` or an allowlist containing the agent) or a matching `inbox:manage` grant. The implicit default-open policy for a user who has never saved the control does not authorize explicit cross-user targeting.
-
-Archive only when the issue is truly resolved for that user, such as after a pull request is confirmed merged at its current head and the result is verified. Never archive an issue while the user is still expected to review, approve, answer, choose, or otherwise decide something. Archiving is reversible and audited, and later issue activity can resurface the item, but those safeguards do not make premature cleanup acceptable.
-
-Every archive/unarchive mutation must include `X-Paperclip-Run-Id`. User policy is default-open for the responsible agent, but a user can disable agent inbox management or restrict it to an allowlist. Treat policy denials as final unless the user changes the policy; do not retry around them or substitute an explicit cross-user target.
+Before archiving or unarchiving an issue in a user's Mine inbox (`POST`/`DELETE /api/issues/{issueId}/inbox-archive`), read `references/inbox-management.md`. Never archive while the user is still expected to review, approve, answer, or decide something.
 
 ## Issue Dependencies (Blockers)
 
@@ -323,107 +319,7 @@ Key shared semantics:
 
 ### Standalone Decisions
 
-Create a decision from an issue-scoped agent run with `POST /api/companies/{companyId}/decisions`:
-
-```json
-{
-  "title": "Reassign the blocked launch issue?",
-  "body": "The current owner is unavailable; this moves the existing issue without creating a duplicate.",
-  "ruleKey": "routing.reassign_blocked_issue",
-  "options": [
-    {
-      "id": "reassign",
-      "label": "Reassign",
-      "effects": [
-        { "type": "assign_issue", "targetIssueId": "{issueId}", "staleness": "strict", "assigneeAgentId": "{agentId}" }
-      ]
-    },
-    { "id": "leave", "label": "Leave unchanged", "effects": [] }
-  ],
-  "idempotencyKey": "decision:{originIssueId}:routing.reassign_blocked_issue:v1",
-  "continuationPolicy": "wake_origin_agent"
-}
-```
-
-- `options` accepts 1–8 options; option ids are unique and each option accepts up to 10 effects.
-- Supported effects are `comment_on_issue`, `create_issue`, `update_issue_status`, `assign_issue`, `cancel_issue_tree`, and `resolve_blocker`.
-- `expiresAt` is optional, defaults to seven days, and must be no more than 30 days away.
-- `idempotencyKey` is optional but strongly recommended; reuse is safe only with the same payload.
-- `continuationPolicy` is `none` or `wake_origin_agent`. Use the latter only when resolution or expiry must resume the proposer.
-- Each origin agent may have at most 50 open decisions by default.
-
-Bundle related cross-issue decisions with `POST /api/companies/{companyId}/decision-bundles`:
-
-```json
-{
-  "title": "Launch recovery choices",
-  "summary": "Independent choices for ownership and blocker cleanup.",
-  "decisions": [
-    {
-      "title": "Reassign owner?",
-      "body": "Move the issue to the recovery owner.",
-      "ruleKey": "routing.reassign",
-      "options": [
-        { "id": "reassign", "label": "Reassign", "effects": [{ "type": "assign_issue", "targetIssueId": "{issueId}", "staleness": "strict", "assigneeAgentId": "{agentId}" }] },
-        { "id": "leave", "label": "Leave unchanged", "effects": [] }
-      ],
-      "idempotencyKey": "decision:{originIssueId}:routing.reassign:v1"
-    },
-    {
-      "title": "Clear obsolete blocker?",
-      "body": "Remove the resolved dependency from the blocked issue.",
-      "ruleKey": "blockers.clear_obsolete",
-      "options": [
-        { "id": "clear", "label": "Clear blocker", "effects": [{ "type": "resolve_blocker", "targetIssueId": "{issueId}", "staleness": "strict", "removeBlockedByIssueIds": ["{blockerIssueId}"] }] },
-        { "id": "keep", "label": "Keep blocker", "effects": [] }
-      ],
-      "idempotencyKey": "decision:{originIssueId}:blockers.clear_obsolete:v1"
-    }
-  ]
-}
-```
-
-Bundles accept 1–50 decisions and are created atomically. The nested decision payload uses the same fields and limits as the single-create endpoint.
-
-Create a `request_checkbox_confirmation` (the responder selects any subset, then confirms):
-
-```json
-POST /api/issues/{issueId}/interactions
-{
-  "kind": "request_checkbox_confirmation",
-  "idempotencyKey": "checkbox:{issueId}:cleanup-files:{planRevisionId}",
-  "title": "Confirm files to delete",
-  "summary": "Pick the files you want removed before I run the cleanup.",
-  "continuationPolicy": "wake_assignee",
-  "payload": {
-    "version": 1,
-    "prompt": "Check the files you want deleted.",
-    "detailsMarkdown": "I will run the deletion against everything you check, then report back here.",
-    "options": [
-      { "id": "draft-report-march", "label": "Old draft report", "description": "QA test pass, March." },
-      { "id": "tmp-export-2025", "label": "tmp/export-2025.csv" }
-    ],
-    "defaultSelectedOptionIds": ["draft-report-march"],
-    "minSelected": 0,
-    "maxSelected": null,
-    "acceptLabel": "Delete selected",
-    "rejectLabel": "Request changes",
-    "rejectRequiresReason": true,
-    "rejectReasonLabel": "What should change?",
-    "supersedeOnUserComment": true,
-    "target": {
-      "type": "issue_document",
-      "issueId": "{issueId}",
-      "key": "plan",
-      "revisionId": "{latestPlanRevisionId}"
-    }
-  }
-}
-```
-
-When it is accepted, your wake delivers `result.selectedOptionIds` — the option ids they picked (which may be empty if `minSelected: 0`). Rejection delivers `result.reason` and a `commentId`.
-
-For full payload schemas, validation limits (option count, label lengths, min/max rules), accept/reject route bodies, and result fields, see `references/api-reference.md` -> **Checkbox confirmations**.
+Before creating a standalone `decision`, a decision bundle, a `request_checkbox_confirmation`, or a `request_item_verdicts` card, read `references/interaction-payloads.md` for the complete payloads, limits, and result fields. The routing rule and shared semantics above still apply.
 
 ## MCP Tool Approval Gates
 
@@ -437,35 +333,6 @@ Some MCP tools are configured as **ask first**. Their `tools/list` description s
 Approval requests expire after 60 minutes. After expiry, call the tool again to request a fresh approval. Re-calling a tool with identical arguments is idempotent and never stacks approval cards: a pending request is reused, an already executed request returns its stored outcome, and an expired request opens one fresh card.
 
 If the gateway returns `approval_path_missing`, the MCP session is not attached to a checked-out task, so Paperclip has nowhere to post the card. Re-run the action from a run that has the task checked out.
-
-Create `request_item_verdicts` when each known item needs its own verdict:
-
-```json
-POST /api/issues/{issueId}/interactions
-{
-  "kind": "request_item_verdicts",
-  "idempotencyKey": "verdicts:{issueId}:generated-artifacts:{planRevisionId}",
-  "continuationPolicy": "wake_assignee",
-  "payload": {
-    "version": 1,
-    "prompt": "Review each generated artifact.",
-    "items": [
-      { "id": "api", "label": "API route", "description": "Partial submit endpoint." },
-      { "id": "docs", "label": "Docs update" }
-    ],
-    "verdicts": ["approve", "reject", "defer"],
-    "requireReasonOn": ["reject"],
-    "target": {
-      "type": "issue_document",
-      "issueId": "{issueId}",
-      "key": "plan",
-      "revisionId": "{latestPlanRevisionId}"
-    }
-  }
-}
-```
-
-The responder submits verdicts with `POST /api/issues/{issueId}/interactions/{interactionId}/verdicts`. Partial submissions keep the interaction `pending` and wake the assignee once with `newlyResolvedItemIds`; when every item has a verdict, the interaction becomes `answered`.
 
 ## Niche Workflow Pointers
 
@@ -624,8 +491,6 @@ If the issue identifier is available, prefer the document deep link over a plain
 If you're asked to make a plan, _do not mark the issue as done_. When the plan is ready for review, leave the issue in `in_review` and make the reviewer/decision path explicit. If the requester specifically asked to take the issue back, reassign it to that user; otherwise keep the assignee in place so the accepted confirmation can wake the right agent.
 
 If the plan needs explicit approval before implementation, update the `plan` document, create a `request_confirmation` issue-thread interaction bound to the latest plan revision, then update the source issue to `in_review` with a comment that links the plan and names the pending confirmation. This is a deliberate waiting path, not an abandoned productive run. Wait for acceptance before creating implementation subtasks. See `references/api-reference.md` for the interaction payload.
-
-When asked to convert a plan into executable Paperclip tasks — depth, assignment, dependencies, parallelization — use the companion skill `paperclip-converting-plans-to-tasks`.
 
 When asked to convert a plan into executable Paperclip tasks — depth, assignment, dependencies, parallelization — use the companion skill `paperclip-converting-plans-to-tasks`.
 

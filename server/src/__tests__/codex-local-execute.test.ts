@@ -744,6 +744,76 @@ if (process.argv.includes("resume")) {
     }
   });
 
+  it("sends instructions and the fresh-session prompt when a rejected resume falls back to fresh", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-resume-fallback-prompt-"));
+    const commandPath = path.join(root, "codex");
+    const promptsPath = path.join(root, "prompts.json");
+    const instructionsPath = path.join(root, "AGENTS-instructions.md");
+    await seedSharedCodexAuth(root);
+    await fs.writeFile(instructionsPath, "AGENT INSTRUCTIONS BODY", "utf8");
+    await fs.writeFile(commandPath, `#!/usr/bin/env node
+const fs = require("node:fs");
+const prompts = fs.existsSync(${JSON.stringify(promptsPath)}) ? JSON.parse(fs.readFileSync(${JSON.stringify(promptsPath)}, "utf8")) : [];
+prompts.push({ argv: process.argv.slice(2), prompt: fs.readFileSync(0, "utf8") });
+fs.writeFileSync(${JSON.stringify(promptsPath)}, JSON.stringify(prompts));
+if (process.argv.includes("resume")) {
+  console.error("state db missing rollout path for thread existing-session");
+  process.exitCode = 1;
+} else {
+  console.log(JSON.stringify({ type: "thread.started", thread_id: "fresh-session" }));
+  console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } }));
+}
+`, "utf8");
+    await fs.chmod(commandPath, 0o755);
+    const metrics: Array<Record<string, number> | undefined> = [];
+    try {
+      await execute({
+        runId: "resume-fallback-prompt",
+        agent: { id: "agent-1", companyId: "company-1", name: "Codex", adapterType: "codex_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: "existing-session", sessionParams: null, sessionDisplayId: "existing-session", taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: root,
+          promptTemplate: "HEARTBEAT TEMPLATE",
+          bootstrapPromptTemplate: "BOOTSTRAP PROMPT",
+          instructionsFilePath: instructionsPath,
+        },
+        context: {
+          paperclipWake: {
+            reason: "issue_commented",
+            issue: { id: "issue-1", identifier: "PAP-1", title: "Fix it", status: "in_progress" },
+            comments: [],
+          },
+          paperclipTaskMarkdown: "FULL TASK BRIEF with description",
+          paperclipTaskMarkdownCompact: "COMPACT TASK BRIEF",
+          paperclipFallbackHandoffMarkdown: "FALLBACK HANDOFF NOTE",
+        },
+        onLog: async () => {},
+        onMeta: async (meta) => {
+          metrics.push(meta.promptMetrics);
+        },
+      });
+      const prompts = JSON.parse(await fs.readFile(promptsPath, "utf8")) as Array<{ argv: string[]; prompt: string }>;
+      expect(prompts).toHaveLength(2);
+      expect(prompts[0]?.argv).toContain("resume");
+      expect(prompts[0]?.prompt).toContain("## Paperclip Resume Delta");
+      expect(prompts[0]?.prompt).not.toContain("AGENT INSTRUCTIONS BODY");
+      expect(prompts[0]?.prompt).not.toContain("FALLBACK HANDOFF NOTE");
+      expect(prompts[1]?.argv).not.toContain("resume");
+      expect(prompts[1]?.prompt).not.toContain("## Paperclip Resume Delta");
+      expect(prompts[1]?.prompt).toContain("AGENT INSTRUCTIONS BODY");
+      expect(prompts[1]?.prompt).toContain("BOOTSTRAP PROMPT");
+      expect(prompts[1]?.prompt).toContain("FULL TASK BRIEF with description");
+      expect(prompts[1]?.prompt).toContain("HEARTBEAT TEMPLATE");
+      expect(prompts[1]?.prompt).toContain("FALLBACK HANDOFF NOTE");
+      expect(metrics[1]?.resumeFallback).toBe(1);
+      expect(metrics[1]?.instructionsChars).toBeGreaterThan(0);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("classifies mid-turn harness crashes as retryable transient upstream errors", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-harness-crash-"));
     const workspace = path.join(root, "workspace");

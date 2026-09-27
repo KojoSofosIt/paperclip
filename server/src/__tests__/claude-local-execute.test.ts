@@ -637,6 +637,65 @@ describe("claude execute", () => {
     }
   });
 
+  it("sends the fresh-session prompt, not the resume delta, when a rejected resume falls back to fresh", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-resume-fallback-prompt-"));
+    const { workspace, commandPath, capturePath, statePath, restore } = await setupExecuteEnv(root, {
+      commandWriter: writeRetryThenSucceedClaudeCommand,
+    });
+    const metrics: Array<Record<string, number> | undefined> = [];
+    try {
+      await execute({
+        runId: "run-resume-fallback-prompt",
+        agent: { id: "agent-1", companyId: "co-1", name: "Test", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: "11111111-1111-4111-8111-111111111111", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: {
+            PAPERCLIP_TEST_CAPTURE_PATH: capturePath,
+            PAPERCLIP_TEST_STATE_PATH: statePath,
+          },
+          promptTemplate: "HEARTBEAT TEMPLATE",
+          bootstrapPromptTemplate: "BOOTSTRAP PROMPT",
+        },
+        context: {
+          paperclipWake: {
+            reason: "issue_commented",
+            issue: { id: "issue-1", identifier: "PAP-1", title: "Fix it", status: "in_progress" },
+            comments: [],
+          },
+          paperclipTaskMarkdown: "FULL TASK BRIEF with description",
+          paperclipTaskMarkdownCompact: "COMPACT TASK BRIEF",
+          paperclipFallbackHandoffMarkdown: "FALLBACK HANDOFF NOTE",
+        },
+        authToken: "tok",
+        onLog: async () => {},
+        onMeta: async (meta) => {
+          metrics.push(meta.promptMetrics);
+        },
+      });
+      const captured = JSON.parse(await fs.readFile(capturePath, "utf-8")) as Array<{ argv: string[]; prompt: string }>;
+      expect(captured).toHaveLength(2);
+      expect(captured[0]?.prompt).toContain("Paperclip Resume Delta");
+      expect(captured[0]?.prompt).toContain("COMPACT TASK BRIEF");
+      expect(captured[0]?.prompt).not.toContain("FALLBACK HANDOFF NOTE");
+      expect(captured[0]?.prompt).not.toContain("BOOTSTRAP PROMPT");
+      expect(captured[1]?.argv).not.toContain("--resume");
+      expect(captured[1]?.prompt).not.toContain("Paperclip Resume Delta");
+      expect(captured[1]?.prompt).toContain("BOOTSTRAP PROMPT");
+      expect(captured[1]?.prompt).toContain("FULL TASK BRIEF with description");
+      expect(captured[1]?.prompt).toContain("HEARTBEAT TEMPLATE");
+      expect(captured[1]?.prompt).toContain("FALLBACK HANDOFF NOTE");
+      expect(metrics[0]?.resumedSession).toBe(1);
+      expect(metrics[1]?.resumedSession).toBe(0);
+      expect(metrics[1]?.resumeFallback).toBe(1);
+    } finally {
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("normalizes max-turn exhaustion into scheduler stop metadata", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-exec-max-turns-"));
     const resultEvent = {

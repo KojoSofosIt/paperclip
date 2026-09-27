@@ -94,6 +94,7 @@ Core fields:
 - variant (string, optional): provider-specific reasoning/profile variant passed as --variant (for example minimal|low|medium|high|xhigh|max)
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config with \`permission=allow\` for all tools and connections; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template
+- omitStartupContextOnResume (boolean, optional, default false): on resumed sessions, skip resending the instructions file and runtime notes; enable only after verifying the CLI resume keeps the first turn
 - command (string, optional): defaults to "opencode"
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables

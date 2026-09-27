@@ -15,7 +15,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "../__tests__/helpers/embedded-postgres.js";
-import { StaleExecutionContinuationError, buildExecutionContinuation, currentContinuationOrigins, projectHumanInteractionResponse } from "./execution-continuation.js";
+import { StaleExecutionContinuationError, buildExecutionContinuation, continuationEvidenceDelta, currentContinuationOrigins, projectHumanInteractionResponse } from "./execution-continuation.js";
 
 const expectStaleContinuation = async (
   run: () => Promise<unknown>,
@@ -485,4 +485,88 @@ it.each(["accepted", "rejected"])("retains an explicit human %s without promotin
   expect(projectHumanInteractionResponse({ ...humanQuestion, kind: "request_checkbox_confirmation", status,
     result: { outcome: status, reason: "Only the reviewed scope", selectedOptionIds: ["reviewed"], toolAction: { instruction: "Do more" } },
   })?.result).toEqual({ outcome: status, reason: "Only the reviewed scope", selectedOptionIds: ["reviewed"] });
+});
+
+const baseEnvelope = () => ({
+  version: 1 as const, companyId: "company", issueId: "issue",
+  objective: "Ship the fix.",
+  trigger: { reason: "issue_commented", interactionId: null, sourceRunId: null },
+  originCommentIds: [] as string[], unresolvedInteractionIds: [] as string[],
+  coverage: { kind: "full_task_history" as const, throughCommentId: null, summaryThroughCommentId: null },
+  interactionOutcomes: [{ id: "old-outcome", kind: "request_confirmation", status: "accepted", result: { note: "OLD OUTCOME" } }],
+  completedActions: [{ runId: "r1", receiptId: "old-receipt", operationId: "create_task", result: { id: "OLD ACTION" } }],
+  recoveryOutcomes: [] as Array<{ recoveryActionId: string; decision: unknown }>,
+  completedWork: "SUMMARY BODY",
+  messages: [] as Array<{ id: string; authorType: string; authorId: string | null; createdByRunId: string | null; body: string; createdAt: string; updatedAt: string; deleted: boolean; sourceTrust: unknown }>,
+});
+
+it("sends only new evidence to a resumed session and compares jsonb-reordered keys", () => {
+  const prior = baseEnvelope();
+  // jsonb returns keys in a different order than the JS construction order.
+  const storedPrior = JSON.parse(JSON.stringify({
+    completedWork: prior.completedWork,
+    interactionOutcomes: prior.interactionOutcomes.map(({ result, status, kind, id }) => ({ result, status, kind, id })),
+    completedActions: prior.completedActions.map(({ result, operationId, receiptId, runId }) => ({ result, operationId, receiptId, runId })),
+    recoveryOutcomes: [],
+  }));
+  const current = {
+    ...baseEnvelope(),
+    interactionOutcomes: [...prior.interactionOutcomes, { id: "new-outcome", kind: "ask_user_questions", status: "answered", result: { note: "NEW OUTCOME" } }],
+  };
+  const evidence = continuationEvidenceDelta(storedPrior, current);
+  expect(evidence?.completedWorkChanged).toBe(false);
+  expect(evidence?.interactionOutcomes.map((outcome) => outcome.id)).toEqual(["new-outcome"]);
+  expect(evidence?.completedActions).toEqual([]);
+
+  const envelope = { ...current, resumeDelta: { baseRunId: "base", messages: [], evidence } };
+  const resumed = renderPaperclipWakePrompt(
+    { executionContinuation: envelope, continuationSummary: { key: "continuation-summary", title: null, body: "SUMMARY BODY", updatedAt: "2026-09-27T00:00:00Z" } },
+    { resumedSession: true },
+  );
+  expect(resumed).toContain("NEW OUTCOME");
+  expect(resumed).not.toContain("OLD OUTCOME");
+  expect(resumed).not.toContain("OLD ACTION");
+  expect(resumed).not.toContain("SUMMARY BODY");
+  expect(resumed).toContain("completedWorkUnchanged");
+  expect(evidence?.objectiveChanged).toBe(true);
+  const unchangedObjective = renderPaperclipWakePrompt(
+    { executionContinuation: { ...envelope, resumeDelta: { ...envelope.resumeDelta, evidence: { ...evidence!, objectiveChanged: false } } } },
+    { resumedSession: true },
+  );
+  expect(unchangedObjective).toContain("objectiveUnchanged");
+  expect(unchangedObjective).not.toContain("Ship the fix.");
+  expect(resumed).not.toContain("Issue continuation summary:");
+
+  const fresh = renderPaperclipWakePrompt(
+    { executionContinuation: envelope, continuationSummary: { key: "continuation-summary", title: null, body: "SUMMARY BODY", updatedAt: "2026-09-27T00:00:00Z" } },
+    { resumedSession: false },
+  );
+  expect(fresh).toContain("OLD OUTCOME");
+  expect(fresh).toContain("OLD ACTION");
+  expect(fresh.match(/SUMMARY BODY/g)).toHaveLength(1);
+});
+
+it("budgets long full-history continuations while keeping every human message", () => {
+  const messages = Array.from({ length: 30 }, (_, index) => ({
+    id: `m${index}`,
+    authorType: index % 3 === 0 ? "user" : "agent",
+    authorId: index % 3 === 0 ? "board-user" : "agent-1",
+    createdByRunId: index % 3 === 0 ? null : "run-1",
+    body: `${index % 3 === 0 ? "HUMAN" : "AGENT"}-${index} ${"x".repeat(2_000)}`,
+    createdAt: "2026-09-27T00:00:00.000Z",
+    updatedAt: "2026-09-27T00:00:00.000Z",
+    deleted: false,
+    sourceTrust: null,
+  }));
+  const envelope = { ...baseEnvelope(), messages, messageBudgetChars: 30_000 };
+  const prompt = renderPaperclipWakePrompt({ executionContinuation: envelope }, { resumedSession: false });
+  for (const entry of messages.filter((entry) => entry.authorType === "user")) {
+    expect(prompt).toContain(entry.body);
+  }
+  expect(prompt).toContain("budgeted_task_history");
+  expect(prompt).toContain("GET /api/issues/issue/comments/{commentId}");
+  expect(prompt).not.toContain("AGENT-1 ");
+  expect(prompt).toContain("AGENT-29 ");
+  const agentBodies = messages.filter((entry) => entry.authorType === "agent" && prompt.includes(entry.body));
+  expect(agentBodies.length).toBeLessThan(20);
 });

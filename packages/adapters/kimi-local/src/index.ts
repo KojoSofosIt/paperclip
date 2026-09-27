@@ -69,6 +69,7 @@ Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to the run prompt. Sibling files in the same directory (HEARTBEAT.md, SOUL.md, TOOLS.md) are made readable via --add-dir for local runs.
 - promptTemplate (string, optional): run prompt template
+- omitStartupContextOnResume (boolean, optional, default false): on resumed sessions, skip resending the instructions file and runtime notes; enable only after verifying the CLI resume keeps the first turn
 - model (string, optional): Kimi model alias (provider/model). Defaults to kimi-code/kimi-for-coding.
 - effort (string, optional): thinking effort (low | medium | high | max). CLI lane only (engine=cli): forwarded as KIMI_MODEL_THINKING_EFFORT for effort-capable models (K2.8 Preview, K3, and K3 256K); "medium" maps to "high" since Kimi has no medium tier. Ignored for models without support_efforts, and NOT forwarded on the default ACP engine lane (Kimi ACP exposes a separate "thinking" option that is not wired yet) — pin engine=cli when effort control matters.
 - command (string, optional): defaults to "kimi"

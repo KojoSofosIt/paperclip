@@ -27,6 +27,7 @@ import {
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
+  asBoolean,
   asNumber,
   asStringArray,
   parseObject,
@@ -41,6 +42,7 @@ import {
   renderTemplate,
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
+  selectPaperclipSessionHandoffNote,
   selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -558,6 +560,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     })();
 
     const bootstrapPromptTemplate = asString(config.bootstrapPromptTemplate, "");
+    // Opt-in for operators who verified that this CLI's resume keeps the first
+    // turn: resume deltas then skip the startup instructions and runtime notes.
+    const omitStartupContextOnResume = asBoolean(config.omitStartupContextOnResume, false);
     const templateData = {
       agentId: agent.id,
       companyId: agent.companyId,
@@ -567,39 +572,47 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       run: { id: runId, source: "on_demand" },
       context,
     };
-    const renderedBootstrapPrompt =
-      !sessionId && bootstrapPromptTemplate.trim().length > 0
-        ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+    // Build per provider attempt so a fresh-session retry after a rejected
+    // resume receives the fresh-session prompt instead of the resume delta.
+    const buildBasePrompt = (resumedSession: boolean, resumeFailed = false) => {
+      const renderedBootstrapPrompt =
+        !resumedSession && bootstrapPromptTemplate.trim().length > 0
+          ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+          : "";
+      const taskContextNote = context.conversationMode === true
+        ? selectPaperclipTaskMarkdown(context, { resumedSession, includeCommunicationGuidance: false })
         : "";
-    const taskContextNote = context.conversationMode === true
-      ? selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId), includeCommunicationGuidance: false })
-      : "";
-    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-      conversationMode: context.conversationMode === true,
-      resumedSession: Boolean(sessionId),
-      suppressIssueDescription: taskContextNote.length > 0,
-    });
-    const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-      ? ""
-      : renderTemplate(promptTemplate, templateData);
-    const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-    const basePrompt = joinPromptSections([
-      instructionsPrefix,
-      renderedBootstrapPrompt,
-      wakePrompt,
-      taskContextNote,
-      sessionHandoffNote,
-      renderedPrompt,
-    ]);
-    const promptMetrics = {
-      promptChars: basePrompt.length,
-      instructionsChars: instructionsPrefix.length,
-      bootstrapPromptChars: renderedBootstrapPrompt.length,
-      wakePromptChars: wakePrompt.length,
-      taskContextChars: taskContextNote.length,
-      sessionHandoffChars: sessionHandoffNote.length,
-      heartbeatPromptChars: renderedPrompt.length,
+      const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+        conversationMode: context.conversationMode === true,
+        resumedSession,
+        suppressIssueDescription: taskContextNote.length > 0,
+      });
+      const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
+      const omitStartupContext = shouldUseResumeDeltaPrompt && omitStartupContextOnResume;
+      const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+        ? ""
+        : renderTemplate(promptTemplate, templateData);
+      const sessionHandoffNote = selectPaperclipSessionHandoffNote(context, { resumedSession, resumeFailed });
+      const basePrompt = joinPromptSections([
+        omitStartupContext ? "" : instructionsPrefix,
+        renderedBootstrapPrompt,
+        wakePrompt,
+        taskContextNote,
+        sessionHandoffNote,
+        renderedPrompt,
+      ]);
+      const promptMetrics = {
+        promptChars: basePrompt.length,
+        instructionsChars: omitStartupContext ? 0 : instructionsPrefix.length,
+        bootstrapPromptChars: renderedBootstrapPrompt.length,
+        wakePromptChars: wakePrompt.length,
+        taskContextChars: taskContextNote.length,
+        sessionHandoffChars: sessionHandoffNote.length,
+        heartbeatPromptChars: renderedPrompt.length,
+        resumedSession: resumedSession ? 1 : 0,
+        resumeFallback: resumeFailed ? 1 : 0,
+      };
+      return { basePrompt, promptMetrics };
     };
 
     // Optional diagnostic: surface OpenCode's own logs on stderr (captured into the
@@ -620,7 +633,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return args;
     };
 
-    const runAttempt = async (resumeSessionId: string | null) => {
+    const runAttempt = async (resumeSessionId: string | null, opts: { resumeFailed?: boolean } = {}) => {
+      const { basePrompt, promptMetrics } = buildBasePrompt(Boolean(resumeSessionId), opts.resumeFailed === true);
       const prompt = joinPromptSections([
         selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
         basePrompt,
@@ -749,7 +763,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "stdout",
           `[paperclip] OpenCode session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
-        const retry = await runAttempt(null);
+        const retry = await runAttempt(null, { resumeFailed: true });
         return toResult(retry, true);
       }
 

@@ -123,6 +123,8 @@ export async function buildExecutionContinuation(input: {
   runId?: string;
   summary: string | null;
   exposeLowTrustRaw: boolean;
+  /** Prompt budget for full-history message bodies (see adapter-utils continuation-budget). */
+  messageBudgetChars?: number;
 }): Promise<ExecutionContinuationEnvelope> {
   const { db, companyId, issueId } = input;
   const [issue] = await db
@@ -372,7 +374,7 @@ export async function buildExecutionContinuation(input: {
     (hasConversationContinuationPolicy(lastTerminal.result) ||
       lastTerminal.status === "interrupted" || lastTerminal.errorCode === "process_lost")
     ? lastTerminal.id : undefined);
-  return {
+  const envelope: ExecutionContinuationEnvelope = {
     ...(interruptedRunId ? { interruptedRunId } : {}),
     ...(resumeDelta ? { resumeDelta } : {}),
     recoveryOutcomes: reconciliations
@@ -419,5 +421,55 @@ export async function buildExecutionContinuation(input: {
       throughCommentId: messages.at(-1)?.id ?? null,
       summaryThroughCommentId: null,
     },
+    ...(input.messageBudgetChars !== undefined
+      ? { messageBudgetChars: input.messageBudgetChars }
+      : {}),
+  };
+  if (envelope.resumeDelta) {
+    envelope.resumeDelta.evidence = continuationEvidenceDelta(priorEnvelope, envelope);
+  }
+  return envelope;
+}
+
+// Prior envelopes come back from jsonb with reordered keys, so compare with a
+// key-sorted serialization.
+const sortKeys = (value: unknown): unknown =>
+  Array.isArray(value)
+    ? value.map(sortKeys)
+    : value && typeof value === "object"
+      ? Object.fromEntries(
+          Object.keys(value as Record<string, unknown>)
+            .sort()
+            .map((key) => [key, sortKeys((value as Record<string, unknown>)[key])]),
+        )
+      : value;
+const evidenceKey = (value: unknown) => JSON.stringify(sortKeys(value ?? null));
+
+/**
+ * Evidence the resumed session has not seen yet: compared by content with the
+ * envelope that was delivered to the base run of the same provider session.
+ */
+export function continuationEvidenceDelta(
+  priorEnvelope: Record<string, unknown>,
+  current: ExecutionContinuationEnvelope,
+): NonNullable<ExecutionContinuationEnvelope["resumeDelta"]>["evidence"] {
+  const priorSet = (value: unknown) =>
+    new Set((Array.isArray(value) ? value : []).map(evidenceKey));
+  const priorOutcomes = priorSet(priorEnvelope.interactionOutcomes);
+  const priorActions = priorSet(priorEnvelope.completedActions);
+  const priorRecovery = priorSet(priorEnvelope.recoveryOutcomes);
+  return {
+    objectiveChanged: (string(priorEnvelope.objective) ?? null) !== current.objective,
+    completedWorkChanged:
+      (string(priorEnvelope.completedWork) ?? null) !== (current.completedWork ?? null),
+    interactionOutcomes: current.interactionOutcomes.filter(
+      (outcome) => !priorOutcomes.has(evidenceKey(outcome)),
+    ),
+    completedActions: (current.completedActions ?? []).filter(
+      (action) => !priorActions.has(evidenceKey(action)),
+    ),
+    recoveryOutcomes: (current.recoveryOutcomes ?? []).filter(
+      (outcome) => !priorRecovery.has(evidenceKey(outcome)),
+    ),
   };
 }

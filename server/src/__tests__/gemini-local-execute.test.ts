@@ -406,6 +406,53 @@ describe("gemini execute", () => {
     }
   });
 
+  it.each([false, true])("skips startup instructions on resume deltas only when opted in (opt-in=%s)", async (optIn) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-resume-startup-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "gemini");
+    const capturePath = path.join(root, "capture.json");
+    const instructionsPath = path.join(root, "AGENTS.md");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.writeFile(instructionsPath, "GEMINI AGENT INSTRUCTIONS", "utf8");
+    await writeFakeGeminiCommand(commandPath);
+    const previousHome = process.env.HOME;
+    process.env.HOME = root;
+    try {
+      await execute({
+        runId: `run-resume-startup-${optIn}`,
+        agent: { id: "agent-1", companyId: "company-1", name: "Gemini Coder", adapterType: "gemini_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: "gemini-session-1", sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          instructionsFilePath: instructionsPath,
+          omitStartupContextOnResume: optIn,
+        },
+        context: {
+          paperclipWake: {
+            reason: "issue_commented",
+            issue: { id: "issue-1", identifier: "PAP-874", title: "chat-speed issues", status: "in_progress" },
+            comments: [],
+            fallbackFetchNeeded: false,
+          },
+        },
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      const promptArg = capture.argv[capture.argv.indexOf("--prompt") + 1] ?? "";
+      expect(promptArg).toContain("## Paperclip Resume Delta");
+      if (optIn) expect(promptArg).not.toContain("GEMINI AGENT INSTRUCTIONS");
+      else expect(promptArg).toContain("GEMINI AGENT INSTRUCTIONS");
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("uses a compact wake delta instead of the full heartbeat prompt when resuming a session", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-gemini-resume-wake-"));
     const workspace = path.join(root, "workspace");
