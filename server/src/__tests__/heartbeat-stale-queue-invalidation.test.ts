@@ -113,10 +113,16 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
       `));
       return;
     } catch (error) {
+      const cause = error instanceof Error ? (error.cause as { code?: string; message?: string } | undefined) : undefined;
       const isLateCommentRace =
         error instanceof Error &&
-        error.message.includes("issue_comments_issue_id_issues_id_fk");
-      if (!isLateCommentRace || attempt === 9) {
+        [error.message, cause?.message].some((message) =>
+          message?.includes("issue_comments_issue_id_issues_id_fk"),
+        );
+      // A late background write can also hold row locks that deadlock with the
+      // TRUNCATE's AccessExclusiveLock; Postgres aborts one side with 40P01.
+      const isLateWriteDeadlock = cause?.code === "40P01";
+      if ((!isLateCommentRace && !isLateWriteDeadlock) || attempt === 9) {
         throw error;
       }
 

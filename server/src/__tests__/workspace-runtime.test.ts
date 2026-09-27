@@ -436,6 +436,25 @@ function createWorkspaceOperationRecorderDouble() {
   return { recorder, operations };
 }
 
+// provision-worktree.sh prefers any `paperclipai` on PATH, so a host-installed
+// CLI would run a real `worktree init` against the fixtures' stub configs.
+// Hide those installs so the suite exercises the same fallback path as CI.
+const hostPath = process.env.PATH;
+beforeAll(() => {
+  process.env.PATH = (hostPath ?? "")
+    .split(path.delimiter)
+    .filter((dir) => dir && !existsSync(path.join(dir, "paperclipai")))
+    .join(path.delimiter);
+});
+
+afterAll(() => {
+  if (hostPath === undefined) {
+    delete process.env.PATH;
+  } else {
+    process.env.PATH = hostPath;
+  }
+});
+
 afterEach(async () => {
   await Promise.all(
     Array.from(leasedRunIds).map(async (runId) => {
