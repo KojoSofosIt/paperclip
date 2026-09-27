@@ -46,6 +46,7 @@ import {
   renderTemplate,
   renderPaperclipWakePrompt,
   selectPaperclipTaskMarkdown,
+  selectPaperclipSessionHandoffNote,
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
@@ -1085,7 +1086,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
     const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
     let instructionsPrefix = "";
-    let instructionsChars = 0;
     if (instructionsFilePath) {
       try {
         const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
@@ -1093,7 +1093,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `${instructionsContents}\n\n` +
           `The above agent instructions were loaded from ${instructionsFilePath}. ` +
           `Resolve any relative file references from ${instructionsDir}.\n\n`;
-        instructionsChars = instructionsPrefix.length;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         await onLog(
@@ -1114,19 +1113,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       run: { id: runId, source: "on_demand" },
       context,
     };
-    const renderedBootstrapPrompt =
-      !sessionId && bootstrapPromptTemplate.trim().length > 0
-        ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
-        : "";
-    const taskContextNote = selectPaperclipTaskMarkdown(context, { resumedSession: Boolean(sessionId) });
-    const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
-      resumedSession: Boolean(sessionId),
-      conversationMode: context.conversationMode === true,
-      suppressIssueDescription: taskContextNote.length > 0,
-    });
-    const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
-    const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
-    instructionsChars = promptInstructionsPrefix.length;
+    // Prompt sections are selected per provider attempt: a rejected resume that
+    // falls back to a fresh session needs the fresh-session prompt, including
+    // the stdin-injected instructions that resume deltas skip.
+    const buildPromptSections = (resumedSession: boolean) => {
+      const renderedBootstrapPrompt =
+        !resumedSession && bootstrapPromptTemplate.trim().length > 0
+          ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
+          : "";
+      const taskContextNote = selectPaperclipTaskMarkdown(context, { resumedSession });
+      const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, {
+        resumedSession,
+        conversationMode: context.conversationMode === true,
+        suppressIssueDescription: taskContextNote.length > 0,
+      });
+      const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
+      return { renderedBootstrapPrompt, taskContextNote, wakePrompt, shouldUseResumeDeltaPrompt };
+    };
+    const { shouldUseResumeDeltaPrompt } = buildPromptSections(Boolean(sessionId));
     const continuationSummary = parseObject(context.paperclipContinuationSummary);
     const continuationSummaryBody = asString(continuationSummary.body, "").trim() || null;
     const codexFallbackHandoffNote =
@@ -1196,30 +1200,47 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (preparedRuntimeConfig.notes.length > 0) {
       commandNotes.unshift(...preparedRuntimeConfig.notes);
     }
-    const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
-      ? ""
-      : renderTemplate(promptTemplate, templateData);
-    const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-    const prompt = joinPromptSections([
-      promptInstructionsPrefix,
-      renderedBootstrapPrompt,
-      wakePrompt,
-      codexFallbackHandoffNote,
-      sessionHandoffNote,
-      taskContextNote,
-      renderedPrompt,
-    ]);
-    const promptMetrics = {
-      promptChars: prompt.length,
-      instructionsChars,
-      bootstrapPromptChars: renderedBootstrapPrompt.length,
-      wakePromptChars: wakePrompt.length,
-      sessionHandoffChars: sessionHandoffNote.length,
-      taskContextChars: taskContextNote.length,
-      heartbeatPromptChars: renderedPrompt.length,
+    const buildAttemptPrompt = (resumedSession: boolean, resumeFailed = false) => {
+      const {
+        renderedBootstrapPrompt,
+        taskContextNote,
+        wakePrompt,
+        shouldUseResumeDeltaPrompt: useResumeDelta,
+      } = buildPromptSections(resumedSession);
+      const promptInstructionsPrefix = useResumeDelta ? "" : instructionsPrefix;
+      const renderedPrompt = useResumeDelta || isPaperclipRecoveryWakePayload(context.paperclipWake)
+        ? ""
+        : renderTemplate(promptTemplate, templateData);
+      // The transient-fallback handoff already carries the continuation note;
+      // otherwise use the server-provided rotation/reset or fallback handoff.
+      const sessionHandoffNote = codexFallbackHandoffNote
+        ? asString(context.paperclipSessionHandoffMarkdown, "").trim()
+        : selectPaperclipSessionHandoffNote(context, { resumedSession, resumeFailed });
+      const prompt = joinPromptSections([
+        promptInstructionsPrefix,
+        renderedBootstrapPrompt,
+        wakePrompt,
+        codexFallbackHandoffNote,
+        sessionHandoffNote,
+        taskContextNote,
+        renderedPrompt,
+      ]);
+      const promptMetrics = {
+        promptChars: prompt.length,
+        instructionsChars: promptInstructionsPrefix.length,
+        bootstrapPromptChars: renderedBootstrapPrompt.length,
+        wakePromptChars: wakePrompt.length,
+        sessionHandoffChars: sessionHandoffNote.length + codexFallbackHandoffNote.length,
+        taskContextChars: taskContextNote.length,
+        heartbeatPromptChars: renderedPrompt.length,
+        resumedSession: resumedSession ? 1 : 0,
+        resumeFallback: resumeFailed ? 1 : 0,
+      };
+      return { prompt, promptMetrics };
     };
 
-    const runAttempt = async (resumeSessionId: string | null) => {
+    const runAttempt = async (resumeSessionId: string | null, opts: { resumeFailed?: boolean } = {}) => {
+      const { prompt, promptMetrics } = buildAttemptPrompt(Boolean(resumeSessionId), opts.resumeFailed === true);
       const execArgs = buildCodexExecArgs(
         forceSaferInvocation ? { ...config, fastMode: false } : config,
         {
@@ -1563,7 +1584,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           "stdout",
           `[paperclip] Codex resume session "${sessionId}" is unavailable; retrying with a fresh session.\n`,
         );
-        const retry = await runAttempt(null);
+        const retry = await runAttempt(null, { resumeFailed: true });
         const retryResult = toResult(retry, true, true);
         if (retryResult.errorMessage) {
           executionError = new Error(retryResult.errorMessage);

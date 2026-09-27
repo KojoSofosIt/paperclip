@@ -2196,6 +2196,23 @@ export function selectPaperclipTaskMarkdown(
   return compact || full;
 }
 
+// A fresh provider session that follows prior work needs a carry-forward note.
+// The server supplies `paperclipSessionHandoffMarkdown` when it chose the fresh
+// start (rotation, wake or config reset) and `paperclipFallbackHandoffMarkdown`
+// for runs it expected to resume, which adapters use only after the provider
+// rejected that resume and they retried with a fresh session.
+export function selectPaperclipSessionHandoffNote(
+  context: Record<string, unknown> | null | undefined,
+  options: { resumedSession?: boolean; resumeFailed?: boolean } = {},
+): string {
+  if (options.resumedSession === true) return "";
+  const handoff = asString(context?.paperclipSessionHandoffMarkdown, "").trim();
+  if (handoff) return handoff;
+  return options.resumeFailed === true
+    ? asString(context?.paperclipFallbackHandoffMarkdown, "").trim()
+    : "";
+}
+
 // Runtime-only connector skills are supplied by the server after assignment resolution.
 // Shared-home adapters consume them here on fresh and resumed runs without installing
 // files into a user-wide skills directory. They are not part of serialized wake data.
